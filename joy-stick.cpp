@@ -18,7 +18,7 @@ void loop()
     //打印格式：x原始值|x角度|y原始值|y角度
     Serial.print("x:");
     Serial.print(rawX);
-    serial.print("->");
+    Serial.print("->");
     Serial.print(pwmX);
     Serial.print("°\t"); 
 
