@@ -1,6 +1,6 @@
 #include<Servo.h>
 
-Servo base,lArm,rArm;
+Servo base,lArm,rArm,claw;
 
 //单位mm
 const float L1 = 80.0;//大臂(rArm)
@@ -18,6 +18,7 @@ const float RARM_OFFSET = 180.0;
 const int baseMin = 0, baseMax = 180;
 const int lArmMin = 0, lArmMax = 90;
 const int rArmMin = 90, rArmMax = 180;
+const int clawMin = 0, clawMax = 90;
 
 int DSD = 15;
 
@@ -31,6 +32,9 @@ void setup()
   delay(1000);
   rArm.attach(7,500,2500);
   rArm.write(90);
+  delay(1000);
+  claw.attach(6,500,2500);
+  claw.write(90);
   delay(1000);
   Serial.begin(9600);
   Serial.println("Please Input Data: ");
@@ -52,19 +56,10 @@ void loop()
             x = getValue(serialCmd,'x');
             y = getValue(serialCmd,'y');
             z = getValue(serialCmd,'z');
-
         }
         else Serial.println("+Warning: Wrong Command! ");
 
-        int sBase,sLArm,sRArm;
-
-        if(inverseKinematics(x,y,z,sBase,sLArm,sRArm))
-        {
-            moveServo(base,base.read(),sBase);
-            moveServo(lArm,lArm.read(),sLArm);
-            moveServo(rArm,rArm.read(),sRArm);
-        }
-        else Serial.println("+Warning: Out Of reach");
+        moveTo(x,y,z);
     }
 }
 
@@ -109,17 +104,6 @@ bool inverseKinematics(float x,float y,float z,int &sBase,int &sLArm,int &sRArm)
 
     float B = sBase,L = sLArm,R = sRArm;
 
-    Serial.print(F(" need base = ")); Serial.print(sBase, 1);
-    Serial.print(F(" lArm = "));          Serial.print(sLArm, 1);
-    Serial.print(F(" rArm = "));          Serial.println(sRArm, 1);
-    Serial.print(F(" r = "));             Serial.print(r);
-    Serial.print(F(" theta1 = "));        Serial.print(theta1);
-    Serial.print(F(" theta2 = "));        Serial.print(theta2);
-    Serial.print(F(" theta3 = "));        Serial.println(theta3);
-    Serial.print(F(" sBase = "));Serial.print(B);
-    Serial.print(F(" sLArm = "));Serial.print(L);
-    Serial.print(F(" sRArm = "));Serial.println(R);
-
     if(sBase < baseMin || sBase > baseMax) return false;
     if(sLArm < lArmMin || sLArm > lArmMax) return false;
     if(sRArm < rArmMin || sRArm > rArmMax) return false;
@@ -127,22 +111,27 @@ bool inverseKinematics(float x,float y,float z,int &sBase,int &sLArm,int &sRArm)
     return true;
 }
 
-void moveServo(Servo &servoName, int fromPos, int toPos)
+bool moveTo(float x,float y, float z)
 {
-    if(fromPos>toPos)
+    int sBase ,sLArm,sRArm;
+    if(!inverseKinematics(x,y,z,sBase,sLArm,sRArm));
     {
-        for(int i = fromPos; i >= toPos; i--)
-        {
-            servoName.write(i);
-            delay(DSD);
-        }
+        Serial.println("+Warning: Position out of reach");
+        return false;
     }
-    else
+
+    int fromBase = base.read();
+    int fromLArm = lArm.read();
+    int fromRArm = rArm.read();
+
+    int steps = 20;
+    for(int i = 0;i <= steps;i++)
     {
-        for(int i = fromPos; i <= toPos; i++)
-        {
-            servoName.write(i);
-            delay(DSD);
-        }
+        base.write(fromBase + (sBase - fromBase) * i / steps);
+        lArm.write(fromLArm + (sLArm - fromLArm) * i / steps);
+        rArm.write(fromRArm + (sRArm - fromRArm) * i / steps);
+        delay(20);
     }
+
+    return true;
 }
