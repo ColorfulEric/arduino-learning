@@ -6,7 +6,8 @@ Servo base,lArm,rArm,claw;
 const float L1 = 80.0;//大臂(rArm)
 const float L2 = 80.0;//小臂(lArm)
 const float H = 50.0;//肩部桌面
-const float R_MIN = 20;//最短距离
+//const float S = 70.0 指尖到手腕的长度
+const float R_MIN = 40.0;//最短距离
 
 
 // 舵机初始偏移，需要标定
@@ -48,18 +49,28 @@ void loop()
         serialCmd.trim();
 
         if(serialCmd.length()==0) return;
+        else if(serialCmd=="H") 
+        {
+            goHome();
+            return;
+        }
 
-        int x,y,z;
+        int x,y,z,g;
 
-        if(serialCmd.indexOf('x') != -1 && serialCmd.indexOf('y') != -1 && serialCmd.indexOf('z') != -1)
+        if((serialCmd.indexOf('x') != -1 && serialCmd.indexOf('y') != -1 && serialCmd.indexOf('z') != -1))
         {
             x = getValue(serialCmd,'x');
             y = getValue(serialCmd,'y');
             z = getValue(serialCmd,'z');
-        }
-        else Serial.println("+Warning: Wrong Command! ");
 
-        moveTo(x,y,z);
+            moveTo(x,y,z);
+        }
+
+        if(serialCmd.indexOf('g') != -1)
+        {
+            g = getValue(serialCmd,'g');
+            moveServo(claw,claw.read(),g);
+        }
     }
 }
 
@@ -77,7 +88,7 @@ int getValue(String data, char key)
 bool inverseKinematics(float x,float y,float z,int &sBase,int &sLArm,int &sRArm)
 {
     float r = sqrt(x * x + y * y);
-    if(r < 20.0) return false;
+    if(r < R_MIN) return false;
 
     float D = (r * r + z * z - L1 * L1 - L2 * L2)/(2.0 * L1 * L2);
     if(D < -1.0 || D > 1.0) return false;
@@ -116,7 +127,7 @@ bool moveTo(float x,float y, float z)
     int sBase ,sLArm,sRArm;
     if(!inverseKinematics(x,y,z,sBase,sLArm,sRArm));
     {
-        Serial.println("+Warning: Position out of reach");
+        Serial.println("+Warning: Can not Reach the Position!");
         return false;
     }
 
@@ -134,4 +145,35 @@ bool moveTo(float x,float y, float z)
     }
 
     return true;
+}
+
+void moveServo(Servo &servoName,int from, int to)
+{
+    if(from < to)
+    {
+        for(int i = from;i<=to;i++)
+        {
+            servoName.write(i);
+            delay(15);
+        }
+    }
+    else{
+        for(int i = from;i>=to;i--)
+        {
+            servoName.write(i);
+            delay(15);
+        }
+    }
+}
+
+void goHome()
+{
+    moveServo(base,base.read(),90);
+    delay(1000);
+    moveServo(lArm,lArm.read(),90);
+    delay(1000);
+    moveServo(rArm,rArm.read(),90);
+    delay(1000);
+    moveServo(claw,claw.read(),90);
+    delay(1000);
 }
