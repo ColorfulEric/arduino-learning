@@ -1,3 +1,34 @@
+/* ============================================================================
+   inverseKinematics v4  ——  在 v3 基础上增加“手动示教点位 + 直线回放”
+   （新文件，未修改 inverseKinematics.cpp / inverseKinematicsv3.cpp 及其他文件）
+   ----------------------------------------------------------------------------
+   继承 v3 的内容：
+     1. drawLine() 是笛卡尔空间直线插补（1mm 采样 + 逐点逆解），末端走直线；
+     2. 逆解输出 float 角度，用 Servo.writeMicroseconds() 驱动（约 0.09°/us）；
+     3. 绘制(DRAWING)状态下停用摇杆，避免画画时被摇杆/悬空引脚拉走。
+   v4 新增（本文件主要变化）：
+     4. 手动示教：用摇杆把机械臂摆到纸上的点，按 Y 记录当前舵机状态，
+        程序用正运动学把舵机角度换算成世界坐标存起来（最多 5 个点）；
+     5. 按 E 清除所有已记录的点；
+     6. 按 P 回放：先移动到第 1 个点，再依次用直线插补走到第 2、3…个点；
+        回放前会先检查每一段直线是否全程可达，避免画到一半卡住；
+     7. 按 T 打印已记录的点（调试用）。
+
+   串口协议（9600，需要发送换行）：
+     X<x>,Y<y>,Z<z>      在 DRAWING 模式下移动到世界坐标点，单位 mm
+     d                    在 IDLE / DRAWING 之间切换
+     Y                    记录当前舵机位置为下一个点（手动示教，最多 5 个）
+     E                    清除所有记录点
+     P                    依次用直线连接所有记录点并回放
+     T                    打印已记录的点
+     1                    画直线 (0,120,90)->(120,0,90)
+     2                    画三角形 (-60,60,60) (0,120,60) (60,60,60)
+     ?  I  O  S  H  L  V  A  B  C   同原版（V = 播放摇杆录制，原来的 P）
+   世界坐标：+X=右、+Y=前、+Z=上（相对桌面，肩关节在桌面上方 H=60 处）
+     base 舵机：0°=右、90°=正前、180°=左
+   注意：点位数据存在 RAM 里，断电/复位会丢；需要掉电保存可以再加 EEPROM。
+   ============================================================================ */
+
 #include <Servo.h>
 #include <math.h>
 
@@ -19,12 +50,23 @@ const int lArmPin = A1;
 const int rArmPin = A2;
 const int clawPin = A3;
 
-//限制最大录制时长
+//限制最大录制时长（摇杆录制功能）
 const int MAX_RECORD = 200;
 byte baseRecord[MAX_RECORD];
 byte lArmRecord[MAX_RECORD];
 byte rArmRecord[MAX_RECORD];
 int recordIndex = 0;
+
+//---------------------- v4: 手动示教的点位 ----------------------
+const int MAX_POINTS = 5;  //最多记录 5 个点（题目要求 3~5 个）
+
+struct StoredPoint {
+    float x, y, z;   //世界坐标（mm），由记录时的舵机角度做正运动学算出
+    int sb, sl, sr;  //记录时的舵机角度（方便查看/调试）
+};
+
+StoredPoint points[MAX_POINTS];
+int pointCount = 0;
 
 //限制系统状态：空闲、录制、播放、绘画
 enum State {
@@ -73,6 +115,7 @@ const int SERVO_MIN_US = 500;
 const int SERVO_MAX_US = 2500;
 const float SERVO_DEG_PER_US = 180.0 / (SERVO_MAX_US - SERVO_MIN_US);  // 0.09°/us
 
+//---------------------- 画线参数（v3 新增） ----------------------
 //直线插补步长：越小越直，但点更多、更慢。1mm 时 1° 舵机分辨率是主要误差
 const float LINE_STEP_MM = 1.0;
 //每个插补点之间的延时：决定画线速度，也影响舵机跟随误差
@@ -95,7 +138,7 @@ void speedUp();                      //加快运行速度
 void speedDown();                    //减慢运行速度
 void startRecord();                  //开始录制
 void stopRecord();                   //停止录制
-void playRecord();                   //播放
+void playRecord();                   //播放摇杆录制（v4: 按键改为 V）
 void servoInit();                    //回中
 void printServoInf();                //打印舵机状态
 void pickA();                        //演示动作 A
@@ -105,8 +148,14 @@ bool isLegal(int x, int y, int z);   //判断是否合法
 int getValue(String data, char key); //获取指令数据
 bool inverseKinematics(float x, float y, float z, float& sBase, float& sLArm, float& sRArm, bool verbose);  //逆解
 bool moveTo(float x, float y, float z);  //点对点移动（关节空间插值）
-void drawLine(float fx, float fy, float fz, float tx, float ty, float tz);  //直线插补（笛卡尔空间）
+bool drawLine(float fx, float fy, float fz, float tx, float ty, float tz, bool goToStart = true);  //直线插补（v4: 返回是否画完，可选是否先走到起点）
 void drawTriangle(float xa, float ya, float za, float xb, float yb, float zb, float xc, float yc, float zc);
+void forwardKinematics(float sb, float sl, float sr, float& x, float& y, float& z);  //v4: 舵机角度 -> 世界坐标
+void recordPoint();        //v4: 记录当前点位（Y）
+void clearPoints();        //v4: 清除点位（E）
+void printPoints();        //v4: 打印点位（T）
+bool segmentReachable(const StoredPoint& p0, const StoredPoint& p1);  //v4: 检查一段直线是否全程可达
+void playTrack();          //v4: 依次直线回放所有点位（P）
 
 void setup() {
     Serial.begin(9600);
@@ -327,6 +376,24 @@ void handleSingleCmd(char c) {
         return;
     }
 
+    //v4: 点位示教/回放（IDLE 和 DRAWING 下都可用，不改变当前状态）
+    if (c == 'Y') {
+        recordPoint();
+        return;
+    }
+    if (c == 'E') {
+        clearPoints();
+        return;
+    }
+    if (c == 'P') {
+        playTrack();
+        return;
+    }
+    if (c == 'T') {
+        printPoints();
+        return;
+    }
+
     if (state == IDLE) {
         switch (c) {
             case '?':
@@ -368,8 +435,8 @@ void handleSingleCmd(char c) {
             case 'R':
                 startRecord();
                 break;
-            case 'P':
-                playRecord();
+            case 'V':
+                playRecord();  //v4: 摇杆录制的播放改为 V（P 留给点位回放）
                 break;
             case 'A':
                 pickA();
@@ -538,6 +605,12 @@ void printServoInf() {
     Serial.print("  DSD: ");
     Serial.println(DSD);
 
+    //v4: 顺带显示已记录的点数
+    Serial.print(F("  points: "));
+    Serial.print(pointCount);
+    Serial.print(F("/"));
+    Serial.println(MAX_POINTS);
+
     Serial.print(" State=");
     Serial.println(state);
 
@@ -642,6 +715,8 @@ void pickC()  //不规则物体(钥匙)
 //  r = sqrt(x² + y²)
 //  d = z - H
 //  cos(theta3) = (r² + d² - L1² - L2²) / (2·L1·L2)     ← 必须用 d，不能用 z
+//  theta3 = 180° - 三角形内角 = 肘关节外角 = 小臂相对大臂的转角
+//           （0 = 两杆伸直，180° = 完全折叠；小臂绝对方向角 gamma = theta2 - theta3）
 //  theta2 = atan2(L2·sin(theta3), L1 + L2·cos(theta3)) + atan2(d, r)
 //  theta1 = atan2(y, x)
 bool inverseKinematics(float x, float y, float z, float& sBase, float& sLArm, float& sRArm, bool verbose) {
@@ -675,7 +750,7 @@ bool inverseKinematics(float x, float y, float z, float& sBase, float& sLArm, fl
         return false;
     }
 
-    //余弦定理求肘关节内角 theta3
+    //余弦定理求肘关节外角 theta3（= 小臂相对大臂的转角：0=伸直，π=完全折叠）
     float cosT3 = (r * r + d * d - L1 * L1 - L2 * L2) / (2.0 * L1 * L2);
     if (cosT3 > 1.0) cosT3 = 1.0;    // 数值保护
     if (cosT3 < -1.0) cosT3 = -1.0;
@@ -750,20 +825,22 @@ bool moveTo(float x, float y, float z) {
     return true;
 }
 
-//============================== 直线插补（v3 核心） ==============================
+//============================== 直线插补（v3 核心 / v4 增加返回值） ==============================
 //把世界坐标里的直线拆成很多小段：每一小段都逆解，再直接把三个舵机写到该点。
 //这样末端走的是直线，而不是“关节空间插值”形成的圆弧。
-void drawLine(float fx, float fy, float fz, float tx, float ty, float tz) {
+//goToStart = true：先 moveTo 到起点（单条线用）；
+//goToStart = false：调用者保证已经在起点（连续多段回放用，省掉重复的起手动作）。
+bool drawLine(float fx, float fy, float fz, float tx, float ty, float tz, bool goToStart) {
     //1) 先检查两个端点是否可达（避免白跑一趟）
     float a, b, c;
     if (!inverseKinematics(fx, fy, fz, a, b, c, false) ||
         !inverseKinematics(tx, ty, tz, a, b, c, false)) {
         Serial.println("+Warning: Endpoint unreachable, line skipped.");
-        return;
+        return false;
     }
 
     //2) 先走到起点（这一段是关节空间移动，不属于画出来的线）
-    if (!moveTo(fx, fy, fz)) return;
+    if (goToStart && !moveTo(fx, fy, fz)) return false;
 
     //3) 按 LINE_STEP_MM 把直线拆成 n 段
     float dx = tx - fx;
@@ -790,7 +867,7 @@ void drawLine(float fx, float fy, float fz, float tx, float ty, float tz) {
             //中间某个点不可达：停下来并提示，避免机械臂乱甩
             Serial.print(F("+Warning: point out of reach, i = "));
             Serial.println(i);
-            return;
+            return false;
         }
 
         servoWriteDeg(base, sB);
@@ -806,10 +883,206 @@ void drawLine(float fx, float fy, float fz, float tx, float ty, float tz) {
     }
 
     Serial.println(F("Line done."));
+    return true;
 }
 
 void drawTriangle(float xa, float ya, float za, float xb, float yb, float zb, float xc, float yc, float zc) {
     drawLine(xa, ya, za, xb, yb, zb);
     drawLine(xb, yb, zb, xc, yc, zc);
     drawLine(xc, yc, zc, xa, ya, za);
+}
+
+//============================== v4: 手动示教点位 + 直线回放 ==============================
+//正运动学：已知三个舵机角度，求末端世界坐标
+//（用于把“摇杆手动摆到的位置”变成世界坐标存起来）
+//  theta1 = sBase
+//  theta2 = RARM_OFFSET - sRArm
+//  gamma  = sLArm - LARM_OFFSET      // 小臂的绝对方向角 = theta2 - theta3
+//                                    //（theta3 是肘部外角，即小臂相对大臂的转角）
+//  r = L1*cos(theta2) + L2*cos(gamma)
+//  d = L1*sin(theta2) + L2*sin(gamma)
+//  x = r*cos(theta1), y = r*sin(theta1), z = d + H
+void forwardKinematics(float sb, float sl, float sr, float& x, float& y, float& z) {
+    float t1 = radians(sb);
+    float t2 = radians(RARM_OFFSET - sr);
+    float gamma = radians(sl - LARM_OFFSET);
+    float r = L1 * cos(t2) + L2 * cos(gamma);
+    float d = L1 * sin(t2) + L2 * sin(gamma);
+    x = r * cos(t1);
+    y = r * sin(t1);
+    z = d + H;
+}
+
+//按 Y：记录当前舵机位置为下一个点
+void recordPoint() {
+    if (pointCount >= MAX_POINTS) {
+        Serial.print(F("+Warning: already "));
+        Serial.print(MAX_POINTS);
+        Serial.println(F(" points, press E to clear."));
+        return;
+    }
+
+    //记录当前“下发”的舵机角度（摇杆控制时就是机械臂现在的位置）
+    int sb = base.read();
+    int sl = lArm.read();
+    int sr = rArm.read();
+
+    if (!isLegal(sb, sl, sr)) {
+        Serial.println(F("+Warning: current pose out of servo limits, not recorded."));
+        return;
+    }
+
+    //正解得到世界坐标
+    float x, y, z;
+    forwardKinematics(sb, sl, sr, x, y, z);
+
+    //base 在 180° 极限位置时，float 的 sin(pi) 会得到极小的负数，
+    //同一个点会被算到 -y 一侧（回放时 base 解出 -180 而超限），这里把极限方向上的微小 y 归零。
+    if (fabs(y) < 0.01f) y = 0.0f;
+
+    //反解验证：保证这个点回放时一定能解出来
+    float tb, tl, tr;
+    if (!inverseKinematics(x, y, z, tb, tl, tr, false)) {
+        Serial.println(F("+Warning: recorded pose cannot be solved back, not recorded."));
+        return;
+    }
+
+    //镜像位形检查：如果末端在同一个点、但手臂是“反向折叠”的（正解再反解回不到原角度），
+    //回放时 base 会转到相反方向、臂形完全不同，所以直接拒绝，避免回放时突然翻臂。
+    //正常位形下正解再反解是精确的（只有浮点误差，diff 约 0.00x°）；
+    //镜像位形的角度差通常在 100° 以上，所以 10° 是一个两边都留足余量的经验阈值。
+    //注意：base 角是“圆形”的，-180° 与 +180° 是同一个位置（float 在 180° 处会算出 -180），
+    //      所以要先做角度回绕，否则最左边（base=180°）的正常点位会被误判。
+    float dBase = fabs(tb - sb);
+    if (dBase > 180.0) dBase = 360.0 - dBase;
+    float diff = dBase + fabs(tl - sl) + fabs(tr - sr);
+    if (diff > 10.0) {
+        Serial.println(F("+Warning: mirrored arm pose, move the arm to the normal side and retry."));
+        return;
+    }
+
+    points[pointCount].x = x;
+    points[pointCount].y = y;
+    points[pointCount].z = z;
+    points[pointCount].sb = sb;
+    points[pointCount].sl = sl;
+    points[pointCount].sr = sr;
+    pointCount++;
+
+    Serial.print(F("Point "));
+    Serial.print(pointCount);
+    Serial.print(F("/"));
+    Serial.print(MAX_POINTS);
+    Serial.print(F(" saved: servo("));
+    Serial.print(sb);
+    Serial.print(F(","));
+    Serial.print(sl);
+    Serial.print(F(","));
+    Serial.print(sr);
+    Serial.print(F(") -> world("));
+    Serial.print(x, 1);
+    Serial.print(F(", "));
+    Serial.print(y, 1);
+    Serial.print(F(", "));
+    Serial.print(z, 1);
+    Serial.println(F(")"));
+}
+
+//按 E：清除所有点
+void clearPoints() {
+    pointCount = 0;
+    Serial.println(F("All points cleared."));
+}
+
+//按 T：打印已记录的点
+void printPoints() {
+    if (pointCount == 0) {
+        Serial.println(F("No points recorded."));
+        return;
+    }
+    for (int i = 0; i < pointCount; i++) {
+        Serial.print(F("Point "));
+        Serial.print(i + 1);
+        Serial.print(F(": servo("));
+        Serial.print(points[i].sb);
+        Serial.print(F(","));
+        Serial.print(points[i].sl);
+        Serial.print(F(","));
+        Serial.print(points[i].sr);
+        Serial.print(F(") world("));
+        Serial.print(points[i].x, 1);
+        Serial.print(F(", "));
+        Serial.print(points[i].y, 1);
+        Serial.print(F(", "));
+        Serial.print(points[i].z, 1);
+        Serial.println(F(")"));
+    }
+}
+
+//检查 p0 -> p1 这条直线上的每个采样点是否都能逆解出来（只计算，不动机器）
+bool segmentReachable(const StoredPoint& p0, const StoredPoint& p1) {
+    float dx = p1.x - p0.x;
+    float dy = p1.y - p0.y;
+    float dz = p1.z - p0.z;
+    float len = sqrt(dx * dx + dy * dy + dz * dz);
+
+    int n = (int)ceil(len / LINE_STEP_MM);
+    if (n < 1) n = 1;
+    if (n > LINE_MAX_POINTS) n = LINE_MAX_POINTS;
+
+    for (int i = 0; i <= n; i++) {
+        float u = (float)i / (float)n;
+        float sb, sl, sr;
+        if (!inverseKinematics(p0.x + dx * u, p0.y + dy * u, p0.z + dz * u, sb, sl, sr, false)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+//按 P：从第 1 个点出发，依次用直线连到后面的点
+void playTrack() {
+    if (pointCount < 2) {
+        Serial.println(F("+Warning: need at least 2 points. Move arm and press Y."));
+        return;
+    }
+
+    //先检查所有直线段，避免画到一半才发现某段够不着
+    for (int i = 1; i < pointCount; i++) {
+        if (!segmentReachable(points[i - 1], points[i])) {
+            Serial.print(F("+Warning: segment "));
+            Serial.print(i);
+            Serial.println(F(" is not fully reachable, playback cancelled."));
+            return;
+        }
+    }
+
+    State saved = state;
+    state = PLAYING;  //回放期间停用摇杆
+    Serial.print(F("Playing "));
+    Serial.print(pointCount);
+    Serial.println(F(" points..."));
+
+    //先移动到第 1 个点（这一段不要求直线）
+    if (!moveTo(points[0].x, points[0].y, points[0].z)) {
+        Serial.println(F("+Warning: cannot move to point 1, playback cancelled."));
+        state = saved;
+        return;
+    }
+
+    //依次直线连接后面的点
+    for (int i = 1; i < pointCount; i++) {
+        Serial.print(F("Segment "));
+        Serial.print(i);
+        Serial.print(F(" -> "));
+        Serial.println(i + 1);
+        if (!drawLine(points[i - 1].x, points[i - 1].y, points[i - 1].z,
+                      points[i].x, points[i].y, points[i].z, false)) {
+            Serial.println(F("+Warning: playback stopped."));
+            break;
+        }
+    }
+
+    state = saved;
+    Serial.println(F("Play done."));
 }
